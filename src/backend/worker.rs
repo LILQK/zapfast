@@ -2878,12 +2878,39 @@ impl Worker {
         self.refresh_chat_name(id);
     }
 
+    /// Mutes synced for channels we no longer follow used to file them as
+    /// empty conversations, which the list could only name "Unknown". Once the
+    /// server has listed the followed ones, drop the others that never held a
+    /// message, as the phone does not show them either. No removal barrier
+    /// is kept, so following one again later brings its history back.
+    fn drop_unfollowed_empty_channels(&mut self, followed: &[(String, String)]) {
+        let Ok(chats) = self.archive.chats() else {
+            return;
+        };
+        for chat in chats {
+            if !chat.is_channel()
+                || chat.last.is_some()
+                || chat.last_activity != 0
+                || followed.iter().any(|(id, _)| *id == chat.id)
+            {
+                continue;
+            }
+            if self
+                .archive
+                .delete_chat(&chat.id)
+                .is_ok_and(|removed| removed.existed)
+            {
+                self.emit(Event::ChatRemoved { chat: chat.id });
+            }
+        }
+    }
+
     /// Replaces a fallback chat name when a better one is known.
     fn refresh_chat_name(&mut self, id: &str) {
         let Ok(Some(chat)) = self.archive.chat(id) else {
             return;
         };
-        if chat.kind == ChatKind::Group {
+        if keeps_its_name(&chat) {
             return;
         }
         let name = self.chat_name(id, None);
@@ -2896,7 +2923,7 @@ impl Worker {
     fn ensure_chat(&mut self, id: &str, push_name: Option<&str>) {
         match self.archive.chat(id) {
             Ok(Some(chat)) => {
-                if chat.kind != ChatKind::Group {
+                if !keeps_its_name(&chat) {
                     let name = self.chat_name(id, push_name);
                     if name != chat.name {
                         let _ = self.archive.rename_chat(id, &name);
@@ -3247,12 +3274,20 @@ impl Worker {
                                         )
                                     })
                                     .collect();
+                                // History sync often carries no channel name,
+                                // which leaves only the bare id to show.
+                                let names = list
+                                    .iter()
+                                    .filter(|channel| !channel.name.trim().is_empty())
+                                    .map(|channel| (channel.jid.to_string(), channel.name.clone()))
+                                    .collect();
                                 let mutes = list
                                     .into_iter()
                                     .filter_map(|channel| {
                                         Some((channel.jid.to_string(), channel.muted?))
                                     })
                                     .collect();
+                                let _ = channels.send(Command::ChannelNames(names));
                                 let _ = channels.send(Command::ChannelMutes(mutes));
                                 let _ = channels.send(Command::ChannelPictures(Some(pictures)));
                             }
@@ -3436,6 +3471,12 @@ impl Worker {
             }
             E::MuteUpdate(update) => {
                 let chat = self.canonical(&update.jid);
+                // App state keeps mutes of channels long unfollowed, and a
+                // channel's own Mute comes from the server's list instead.
+                // Such a mute must not file an empty "Unknown" channel.
+                if chat.ends_with("@newsletter") && matches!(self.archive.chat(&chat), Ok(None)) {
+                    return;
+                }
                 self.ensure_chat(&chat, None);
                 let until = if update.action.muted.unwrap_or(false) {
                     Some(seconds(update.action.mute_end_timestamp.unwrap_or(0)))
@@ -7250,6 +7291,18 @@ impl Worker {
                     }
                 }
             }
+            Command::ChannelNames(names) => {
+                self.drop_unfollowed_empty_channels(&names);
+                for (chat, name) in names {
+                    let Ok(Some(known)) = self.archive.chat(&chat) else {
+                        continue;
+                    };
+                    if name != known.name {
+                        let _ = self.archive.rename_chat(&chat, &name);
+                        self.emit_chat(&chat);
+                    }
+                }
+            }
             Command::ChannelPictures(list) => self.channel_pictures_listed(list),
             Command::SetFavorite(chat, favorite) => self.set_favorite_chat(&chat, favorite),
             Command::FavoritesSent {
@@ -10280,6 +10333,13 @@ fn fallback_name(id: &str) -> String {
         None if ChatKind::from_id(id) == ChatKind::Group => String::new(),
         None => id.split('@').next().unwrap_or(id).to_owned(),
     }
+}
+
+/// Whether a chat's stored name outranks one rebuilt from contacts: a group's
+/// subject, or a channel's name from the server. A channel still showing its
+/// bare id may be renamed.
+fn keeps_its_name(chat: &Chat) -> bool {
+    chat.kind == ChatKind::Group || (chat.is_channel() && chat.name != fallback_name(&chat.id))
 }
 
 /// Normalizes WhatsApp timestamps to seconds.
@@ -13981,6 +14041,56 @@ mod tests {
         assert!(worker.archive.chat(MUTED).unwrap().unwrap().muted(now));
         assert!(!worker.archive.chat(UNMUTED).unwrap().unwrap().muted(now));
         assert!(worker.archive.chat("unknown@newsletter").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_names_from_the_server_replace_the_bare_id_and_stay() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        const CHANNEL: &str = "120363000000000001@newsletter";
+        worker
+            .archive
+            .ensure_chat(CHANNEL, &fallback_name(CHANNEL))
+            .unwrap();
+        worker
+            .handle_command(Command::ChannelNames(vec![
+                (CHANNEL.into(), "Fixture news".into()),
+                ("unknown@newsletter".into(), "Elsewhere".into()),
+            ]))
+            .await;
+        let name = |worker: &Worker| worker.archive.chat(CHANNEL).unwrap().unwrap().name;
+        assert_eq!(name(&worker), "Fixture news");
+        assert!(worker.archive.chat("unknown@newsletter").unwrap().is_none());
+        // A later message or contact update must not put the id back.
+        worker.ensure_chat(CHANNEL, None);
+        worker.refresh_chat_name(CHANNEL);
+        assert_eq!(name(&worker), "Fixture news");
+    }
+
+    #[tokio::test]
+    async fn empty_channels_we_do_not_follow_are_dropped() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        const FOLLOWED: &str = "1@newsletter";
+        const EMPTY: &str = "2@newsletter";
+        const ACTIVE: &str = "3@newsletter";
+        const GROUP: &str = "1-2@g.us";
+        for id in [FOLLOWED, EMPTY, ACTIVE, GROUP] {
+            worker.archive.ensure_chat(id, &fallback_name(id)).unwrap();
+        }
+        worker
+            .archive
+            .touch_activity(ACTIVE, 1_700_000_000)
+            .unwrap();
+        worker
+            .handle_command(Command::ChannelNames(vec![(
+                FOLLOWED.into(),
+                "Fixture news".into(),
+            )]))
+            .await;
+        let kept = |id| worker.archive.chat(id).unwrap().is_some();
+        assert!(kept(FOLLOWED));
+        assert!(!kept(EMPTY), "an empty channel we do not follow goes");
+        assert!(kept(ACTIVE), "a channel that held messages stays");
+        assert!(kept(GROUP), "only channels are affected");
     }
 
     fn unconfirmed(worker: &mut Worker) {
@@ -18799,6 +18909,33 @@ mod receipt_tests {
             });
             assert_eq!(chat.muted_until, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn a_synced_mute_does_not_file_a_channel_we_do_not_have() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        const GONE: &str = "1@newsletter";
+        const KEPT: &str = "2@newsletter";
+        worker.archive.ensure_chat(KEPT, "Fixture news").unwrap();
+        for channel in [GONE, KEPT] {
+            let mute = wa_events::MuteUpdate::builder()
+                .jid(channel.parse().unwrap())
+                .timestamp(whatsapp_rust::wacore::time::now_utc())
+                .from_full_sync(true)
+                .action(Box::new({
+                    let mut proto = wa::sync_action_value::MuteAction::default();
+                    proto.muted = Some(true);
+                    proto.mute_end_timestamp = Some(-1);
+                    proto
+                }))
+                .build();
+            worker
+                .handle_wa_event(Arc::new(wa_events::Event::MuteUpdate(mute)))
+                .await;
+        }
+        assert!(worker.archive.chat(GONE).unwrap().is_none());
+        let kept = worker.archive.chat(KEPT).unwrap().unwrap();
+        assert_eq!(kept.muted_until, Some(0), "a channel we have still mutes");
     }
 
     #[tokio::test]
