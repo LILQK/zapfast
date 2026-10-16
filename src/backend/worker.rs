@@ -744,6 +744,7 @@ pub async fn run(
         presence_in_flight: false,
         presence_refresh_pending: false,
         presence_generation: 0,
+        channel_list_generation: 0,
         pending_older: HashMap::new(),
         older_warned: HashSet::new(),
         pending_avatars: HashMap::new(),
@@ -1160,6 +1161,9 @@ struct Worker {
     presence_refresh_pending: bool,
     /// Invalidates completions from an older connection.
     presence_generation: u64,
+    /// Bumped by each connection's followed-channel query, so the answer of
+    /// an earlier one cannot rename or drop channels after a newer one.
+    channel_list_generation: u64,
     /// Pending phone-history requests by chat.
     pending_older: HashMap<ChatId, OlderRequest>,
     /// Chats already told that the phone did not answer; cleared when the
@@ -3260,6 +3264,8 @@ impl Worker {
                     spawn_calling_gate_log(client.clone());
                     let channels = self.commands.clone();
                     let followed = client.clone();
+                    self.channel_list_generation = self.channel_list_generation.wrapping_add(1);
+                    let generation = self.channel_list_generation;
                     tokio::spawn(async move {
                         // A channel's Mute lives on the channel, not in the
                         // chat's app state, so read it from the server.
@@ -3275,10 +3281,11 @@ impl Worker {
                                     })
                                     .collect();
                                 // History sync often carries no channel name,
-                                // which leaves only the bare id to show.
+                                // which leaves only the bare id to show. Every
+                                // id goes, named or not: the list is also what
+                                // tells a followed channel from a stale one.
                                 let names = list
                                     .iter()
-                                    .filter(|channel| !channel.name.trim().is_empty())
                                     .map(|channel| (channel.jid.to_string(), channel.name.clone()))
                                     .collect();
                                 let mutes = list
@@ -3287,7 +3294,7 @@ impl Worker {
                                         Some((channel.jid.to_string(), channel.muted?))
                                     })
                                     .collect();
-                                let _ = channels.send(Command::ChannelNames(names));
+                                let _ = channels.send(Command::ChannelNames { generation, names });
                                 let _ = channels.send(Command::ChannelMutes(mutes));
                                 let _ = channels.send(Command::ChannelPictures(Some(pictures)));
                             }
@@ -5119,7 +5126,14 @@ impl Worker {
                     || existing
                         .as_ref()
                         .is_some_and(|chat| chat.group_subject_known);
+                let named_channel = existing
+                    .as_ref()
+                    .filter(|known| known.is_channel() && keeps_its_name(known));
                 let name = match chat.name {
+                    // The server's list names a channel; history may not.
+                    _ if named_channel.is_some() => named_channel
+                        .map(|known| known.name.clone())
+                        .unwrap_or_default(),
                     Some(name) if ChatKind::from_id(&id) == ChatKind::Group => name,
                     Some(name) if !name.is_empty() => {
                         // Prefer the phone's address-book name for direct chats.
@@ -7291,9 +7305,15 @@ impl Worker {
                     }
                 }
             }
-            Command::ChannelNames(names) => {
+            Command::ChannelNames { generation, names } => {
+                if generation != self.channel_list_generation {
+                    return;
+                }
                 self.drop_unfollowed_empty_channels(&names);
                 for (chat, name) in names {
+                    if name.trim().is_empty() {
+                        continue;
+                    }
                     let Ok(Some(known)) = self.archive.chat(&chat) else {
                         continue;
                     };
@@ -14052,10 +14072,13 @@ mod tests {
             .ensure_chat(CHANNEL, &fallback_name(CHANNEL))
             .unwrap();
         worker
-            .handle_command(Command::ChannelNames(vec![
-                (CHANNEL.into(), "Fixture news".into()),
-                ("unknown@newsletter".into(), "Elsewhere".into()),
-            ]))
+            .handle_command(Command::ChannelNames {
+                generation: worker.channel_list_generation,
+                names: vec![
+                    (CHANNEL.into(), "Fixture news".into()),
+                    ("unknown@newsletter".into(), "Elsewhere".into()),
+                ],
+            })
             .await;
         let name = |worker: &Worker| worker.archive.chat(CHANNEL).unwrap().unwrap().name;
         assert_eq!(name(&worker), "Fixture news");
@@ -14080,17 +14103,59 @@ mod tests {
             .archive
             .touch_activity(ACTIVE, 1_700_000_000)
             .unwrap();
+        const UNNAMED: &str = "4@newsletter";
         worker
-            .handle_command(Command::ChannelNames(vec![(
-                FOLLOWED.into(),
-                "Fixture news".into(),
-            )]))
+            .archive
+            .ensure_chat(UNNAMED, &fallback_name(UNNAMED))
+            .unwrap();
+        worker
+            .handle_command(Command::ChannelNames {
+                generation: worker.channel_list_generation,
+                names: vec![
+                    (FOLLOWED.into(), "Fixture news".into()),
+                    (UNNAMED.into(), " ".into()),
+                ],
+            })
             .await;
         let kept = |id| worker.archive.chat(id).unwrap().is_some();
         assert!(kept(FOLLOWED));
+        assert!(kept(UNNAMED), "a followed channel without a name stays");
+        assert_eq!(
+            worker.archive.chat(UNNAMED).unwrap().unwrap().name,
+            fallback_name(UNNAMED),
+            "a blank name renames nothing"
+        );
         assert!(!kept(EMPTY), "an empty channel we do not follow goes");
         assert!(kept(ACTIVE), "a channel that held messages stays");
         assert!(kept(GROUP), "only channels are affected");
+    }
+
+    #[tokio::test]
+    async fn an_earlier_connection_channel_list_changes_nothing() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        const CHANNEL: &str = "1@newsletter";
+        const EMPTY: &str = "2@newsletter";
+        worker
+            .archive
+            .ensure_chat(CHANNEL, &fallback_name(CHANNEL))
+            .unwrap();
+        worker
+            .archive
+            .ensure_chat(EMPTY, &fallback_name(EMPTY))
+            .unwrap();
+        let stale = worker.channel_list_generation;
+        worker.channel_list_generation = stale.wrapping_add(1);
+        worker
+            .handle_command(Command::ChannelNames {
+                generation: stale,
+                names: vec![(CHANNEL.into(), "Old name".into())],
+            })
+            .await;
+        assert_eq!(
+            worker.archive.chat(CHANNEL).unwrap().unwrap().name,
+            fallback_name(CHANNEL)
+        );
+        assert!(worker.archive.chat(EMPTY).unwrap().is_some());
     }
 
     fn unconfirmed(worker: &mut Worker) {
@@ -16653,6 +16718,7 @@ mod receipt_tests {
             presence_in_flight: false,
             presence_refresh_pending: false,
             presence_generation: 0,
+            channel_list_generation: 0,
             pending_older: HashMap::new(),
             older_warned: HashSet::new(),
             pending_avatars: HashMap::new(),
@@ -18909,6 +18975,37 @@ mod receipt_tests {
             });
             assert_eq!(chat.muted_until, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn history_keeps_a_channel_name_from_the_server() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        const CHANNEL: &str = "1@newsletter";
+        worker
+            .archive
+            .ensure_chat(CHANNEL, &fallback_name(CHANNEL))
+            .unwrap();
+        worker
+            .handle_command(Command::ChannelNames {
+                generation: worker.channel_list_generation,
+                names: vec![(CHANNEL.into(), "Fixture news".into())],
+            })
+            .await;
+        let replay = ParsedHistory {
+            chats: vec![parse_conversation({
+                let mut proto = wa::Conversation::default();
+                proto.id = CHANNEL.into();
+                proto.name = Some("Older name".into());
+                proto.conversation_timestamp = Some(200);
+                proto
+            })],
+            push_names: Vec::new(),
+            lids: Vec::new(),
+            stickers: Vec::new(),
+        };
+        worker.apply_history(replay, true);
+        let chat = worker.archive.chat(CHANNEL).unwrap().unwrap();
+        assert_eq!(chat.name, "Fixture news");
     }
 
     #[tokio::test]
